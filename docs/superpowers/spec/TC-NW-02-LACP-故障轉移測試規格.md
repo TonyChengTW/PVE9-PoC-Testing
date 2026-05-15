@@ -463,7 +463,7 @@ echo "$CHECKLIST"
 
 ## 6. 實測結果欄位
 
-### 5.1 測試記錄表#
+### 6.1 測試記錄表#
 
 | 測試日期 | 測試情境 | 通過/失敗 | 切換時間（秒） | 丟包數 | 流量恢復時間 | iperf3 驗證頻寬（Gbps） |
 |----------|----------|----------|--------------|--------|--------------|-------------------|
@@ -487,7 +487,7 @@ echo "$CHECKLIST"
 
 ## 7. 測試步驟#
 
-### 6.1 基準測試（故障前）#
+### 7.1 基準測試（故障前）#
 
 ```bash
 # 啟動 iperf3 server（在目標主機 172.19.0.172 上執行）
@@ -512,7 +512,7 @@ ip -s link show nic2 | grep -A 1 'TX:' | tail -1 | awk '{print $1}' > /tmp/nic2_
 ip -s link show nic3 | grep -A 1 'TX:' | tail -1 | awk '{print $1}' > /tmp/nic3_before
 ```
 
-### 6.2 執行故障模擬 — bond0 nic2 down#
+### 7.2 執行故障模擬 — bond0 nic2 down#
 
 ```bash
 # 啟動 ping 監控（在另一終端執行）
@@ -560,7 +560,7 @@ else:
 kill $PING_PID
 ```
 
-### 6.3 執行故障模擬 — bond2 nic4 down（使用 iperf3 驗證）#
+### 7.3 執行故障模擬 — bond2 nic4 down（使用 iperf3 驗證）#
 
 ```bash
 # 啟動 iperf3 測試（向 172.19.0.172 發送）
@@ -595,7 +595,7 @@ print(f'頻寬: {bw:.2f} Gbps, 丟包率: {loss:.2f}%')
 ip link set up nic4
 ```
 
-### 6.4 執行故障模擬 — bond2 nic5 down（使用 iperf3 驗證）
+### 7.4 執行故障模擬 — bond2 nic5 down（使用 iperf3 驗證）
 
 ```bash
 # 啟動 iperf3 測試（向 172.19.0.172 發送）
@@ -631,7 +631,7 @@ ip link set up nic5
 
 ## 8. 驗證步驟#
 
-### 7.1 檢查 bond 狀態#
+### 8.1 檢查 bond 狀態#
 
 ```bash
 # 驗證 bond0 流量切換
@@ -647,7 +647,7 @@ cat /proc/net/bonding/bond0 | grep "Actor Churn\|Partner Churn"
 # 預期：Churn State: none（協商完成）
 ```
 
-### 7.2 檢查 VM 連線#
+### 8.2 檢查 VM 連線#
 
 ```bash
 # 驗證 VM 持續運行
@@ -659,7 +659,7 @@ pvesh create /nodes/$(hostname)/qemu/105/agent/exec --command "ping -c 100 172.2
 # 預期：packet loss < 3%
 ```
 
-### 7.3 驗證流量切換（使用 iperf3）#
+### 8.3 驗證流量切換（使用 iperf3）#
 
 ```bash
 # 故障後重新測試頻寬
