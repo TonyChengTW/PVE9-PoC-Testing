@@ -56,34 +56,401 @@
 
 ---
 
-## 5. 實測結果欄位
+## 5. 可重複執行測試計劃
 
-### 5.1 測試記錄表
+### 5.1 測試設計原則
 
-| 測試日期 | 測試情境 | 通過/失敗 | 切換時間（秒） | 丟包數 | VM 狀態變化 | Corosync 日誌摘要 | HA 動作（是/否） |
-|----------|----------|----------|--------------|--------|--------------|-------------------|----------------|
-|  | bond0 nic2 down |  |  |  |  |  |  |
-|  | bond0 nic3 down |  |  |  |  |  |  |
-|  | bond0 雙鏈路 down |  |  |  |  |  |  |
-|  | bond2 nic4 down |  |  |  |  |  |  |
-|  | bond2 nic5 down |  |  |  |  |  |  |
-|  | bond2 雙鏈路 down |  |  |  |  |  |  |
-|  | Corosync 隔離 |  |  |  |  |  |  |
+| 原則 | 說明 |
+|------|------|
+| **冪等性 (Idempotent)** | 測試可以安全地重複執行，結果一致 |
+| **可復原 (Recoverable)** | 失敗後可清理並重新執行 |
+| **隔離性 (Isolated)** | 每個測試獨立，不依賴其他測試結果 |
+| **可追蹤 (Traceable)** | 所有操作都有日誌記錄 |
 
-### 5.2 測試結果摘要
+### 5.2 執行流程
 
-- **測試完成日期**：
-- **通過項目**：X / 7
-- **失敗項目**：X / 7
-- **HA 非預期觸發次數**：X 次
-- **最長切換時間**：X.X 秒
-- **最高丟包數**：X 個
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    測試執行流程                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  [0. 清理/重置] → [1. 健康檢查] → [2. 執行測試]              │
+│         ↑                ↓                                  │
+│         │                ↓                                  │
+│         └──── 失敗 → [3. 診斷] → [4. 修復] ──┘              │
+│                                     ↓                        │
+│                               [5. 重新執行]                  │
+│                                     ↓                        │
+│                               [6. 完成/報告]                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 清理/重置腳本（執行前必備）
+
+```bash
+#!/bin/bash
+# cleanup_before_test.sh - 測試前清理與重置
+
+echo "=== 測試前清理開始: $(date) ==="
+
+# 1. 確保所有網路介面已恢復
+ip link set up nic2 2>/dev/null || true
+ip link set up nic3 2>/dev/null || true
+ip link set up nic4 2>/dev/null || true
+ip link set up nic5 2>/dev/null || true
+
+# 2. 清除 iptables 規則
+iptables -F 2>/dev/null || true
+iptables -X 2>/dev/null || true
+
+# 3. 等待網路穩定
+sleep 5
+
+# 4. 驗證網路狀態
+echo "--- 網路狀態檢查 ---"
+cat /proc/net/bonding/bond0 | grep "MII Status"
+cat /proc/net/bonding/bond2 | grep "MII Status"
+
+# 5. 驗證 Cluster 狀態
+echo "--- Cluster 狀態檢查 ---"
+pvecm status 2>/dev/null || echo "WARN: pvecm 失敗"
+
+# 6. 清除之前的測試日誌
+rm -f /tmp/nic*_before /tmp/ha_status_* /tmp/pvecm_* /tmp/iperf_*.json 2>/dev/null || true
+
+echo "=== 清理完成: $(date) ==="
+```
+
+### 5.4 健康檢查清單
+
+```bash
+#!/bin/bash
+# health_check.sh - 測試前健康檢查
+
+CHECK_PASS=true
+
+echo "=== 健康檢查開始: $(date) ==="
+
+# 檢查 1: Cluster Quorate
+echo -n "1. Cluster Quorate: "
+if pvecm status 2>/dev/null | grep -q "Quorate: Yes"; then
+    echo "PASS"
+else
+    echo "FAIL"
+    CHECK_PASS=false
+fi
+
+# 檢查 2: HA 服務運行
+echo -n "2. HA Manager: "
+if ha-manager status 2>/dev/null | grep -q "HA  MANAGER: running"; then
+    echo "PASS"
+else
+    echo "FAIL"
+    CHECK_PASS=false
+fi
+
+# 檢查 3: bond0 狀態
+echo -n "3. bond0 狀態: "
+BOND0_UP=$(cat /proc/net/bonding/bond0 2>/dev/null | grep "MII Status: up" | wc -l)
+if [ "$BOND0_UP" -ge 2 ]; then
+    echo "PASS ($BOND0_UP/2 links up)"
+else
+    echo "FAIL ($BOND0_UP/2 links up)"
+    CHECK_PASS=false
+fi
+
+# 檢查 4: bond2 狀態
+echo -n "4. bond2 狀態: "
+BOND2_UP=$(cat /proc/net/bonding/bond2 2>/dev/null | grep "MII Status: up" | wc -l)
+if [ "$BOND2_UP" -ge 2 ]; then
+    echo "PASS ($BOND2_UP/2 links up)"
+else
+    echo "FAIL ($BOND2_UP/2 links up)"
+    CHECK_PASS=false
+fi
+
+# 檢查 5: VM 105 運行
+echo -n "5. VM 105 狀態: "
+if qm status 105 2>/dev/null | grep -q "status: running"; then
+    echo "PASS"
+else
+    echo "FAIL"
+    CHECK_PASS=false
+fi
+
+# 檢查 6: Corosync members 完整
+echo -n "6. Corosync members: "
+MEMBERS=$(corosync-cmapctl 2>/dev/null | grep "runtime.config.active members" | wc -l)
+if [ "$MEMBERS" -ge 1 ]; then
+    echo "PASS"
+else
+    echo "FAIL"
+    CHECK_PASS=false
+fi
+
+# 檢查 7: SSH 到其他節點
+echo -n "7. SSH 連線 (172.23.0.172): "
+if ssh -o ConnectTimeout=5 root@172.23.0.172 "echo ok" 2>/dev/null | grep -q "ok"; then
+    echo "PASS"
+else
+    echo "FAIL"
+    CHECK_PASS=false
+fi
+
+echo "=== 健康檢查完成: $(date) ==="
+
+if [ "$CHECK_PASS" = false ]; then
+    echo "警告: 健康檢查有失敗項目，請確認後再執行測試"
+    exit 1
+else
+    echo "所有檢查通過，可以執行測試"
+    exit 0
+fi
+```
+
+### 5.5 測試執行包裝腳本
+
+```bash
+#!/bin/bash
+# run_test.sh - 單一測試執行包裝
+
+TEST_NAME=$1
+TEST_CMD=$2
+EXPECTED=$3
+
+LOG_FILE="/tmp/test_result_$(date +%Y%m%d_%H%M%S).log"
+
+echo "=== 執行測試: $TEST_NAME ==="
+echo "時間: $(date)" | tee -a $LOG_FILE
+
+# 執行測試指令
+eval "$TEST_CMD" 2>&1 | tee -a $LOG_FILE
+EXIT_CODE=${PIPESTATUS[0]}
+
+# 等待一段時間讓系統反應
+sleep 5
+
+# 驗證結果
+echo "" | tee -a $LOG_FILE
+echo "=== 驗證結果 ===" | tee -a $LOG_FILE
+
+# SSH 到其他節點驗證
+ssh root@172.23.0.172 "pvecm status" 2>&1 | tee -a $LOG_FILE
+ssh root@172.23.0.173 "ha-manager status" 2>&1 | tee -a $LOG_FILE
+
+echo "" | tee -a $LOG_FILE
+echo "測試結束: $(date)" | tee -a $LOG_FILE
+echo "Log file: $LOG_FILE"
+
+return $EXIT_CODE
+```
+
+### 5.6 失敗處理與重試流程
+
+```bash
+#!/bin/bash
+# retry_test.sh - 失敗時重試機制
+
+MAX_RETRIES=3
+RETRY_DELAY=30
+
+run_test_with_retry() {
+    local TEST_NAME=$1
+    local TEST_CMD=$2
+    local RETRY_COUNT=0
+
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        echo "=== 嘗試執行 ($((RETRY_COUNT + 1))/$MAX_RETRIES): $TEST_NAME ==="
+
+        # 執行清理
+        bash cleanup_before_test.sh
+
+        # 執行測試
+        if run_test.sh "$TEST_NAME" "$TEST_CMD"; then
+            echo "測試通過: $TEST_NAME"
+            return 0
+        else
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "測試失敗，正在診斷..."
+
+            # 診斷
+            echo "=== 診斷資訊 ===" | tee -a /tmp/diagnosis.log
+            date | tee -a /tmp/diagnosis.log
+            ssh root@172.23.0.172 "pvecm status; corosync-cmapctl | grep members" 2>&1 | tee -a /tmp/diagnosis.log
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "等待 $RETRY_DELAY 秒後重試..."
+                sleep $RETRY_DELAY
+            fi
+        fi
+    done
+
+    echo "測試失敗，已達最大重試次數: $MAX_RETRIES"
+    return 1
+}
+```
+
+### 5.7 完整測試執行腳本
+
+```bash
+#!/bin/bash
+# full_test_run.sh - 完整測試計劃執行
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_FILE="/tmp/test_report_$TIMESTAMP.txt"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a $REPORT_FILE
+}
+
+log "========== 開始完整測試執行 =========="
+log "報告檔案: $REPORT_FILE"
+
+# 階段 0: 清理
+log "--- 階段 0: 清理與重置 ---"
+bash cleanup_before_test.sh
+
+# 階段 1: 健康檢查
+log "--- 階段 1: 健康檢查 ---"
+if ! bash health_check.sh; then
+    log "錯誤: 健康檢查失敗，請先修復問題"
+    exit 1
+fi
+
+# 測試矩陣
+TESTS=(
+    "bond0_nic2_down:ip link set down nic2:nic2 should recover"
+    "bond0_nic3_down:ip link set down nic3:nic3 should recover"
+    "bond0_dual_down:ip link set down nic2 && ip link set down nic3:both should recover"
+    "bond2_nic4_down:ip link set down nic4:nic4 should recover"
+    "bond2_nic5_down:ip link set down nic5:nic5 should recover"
+)
+
+# 階段 2: 執行測試
+log "--- 階段 2: 執行測試 ---"
+PASSED=0
+FAILED=0
+
+for test_spec in "${TESTS[@]}"; do
+    IFS=':' read -r name cmd expected <<< "$test_spec"
+
+    log "執行: $name"
+    log "指令: $cmd"
+
+    # 先清理
+    bash cleanup_before_test.sh
+
+    # 執行
+    eval "$cmd"
+
+    # 等待觀察
+    sleep 10
+
+    # 驗證
+    if ssh root@172.23.0.172 "pvecm status" 2>/dev/null | grep -q "Quorate: Yes"; then
+        log "結果: PASS"
+        PASSED=$((PASSED + 1))
+    else
+        log "結果: FAIL"
+        FAILED=$((FAILED + 1))
+        # 重試
+        log "重試測試: $name"
+        bash retry_test.sh "$name" "$cmd"
+    fi
+
+    # 恢復
+    ip link set up nic2 2>/dev/null || true
+    ip link set up nic3 2>/dev/null || true
+    ip link set up nic4 2>/dev/null || true
+    ip link set up nic5 2>/dev/null || true
+    sleep 5
+done
+
+# 階段 3: 最終驗證
+log "--- 階段 3: 最終驗證 ---"
+bash health_check.sh
+
+# 階段 4: 生成報告
+log "========== 測試執行完成 =========="
+log "通過: $PASSED"
+log "失敗: $FAILED"
+log "報告: $REPORT_FILE"
+```
+
+### 5.8 測試結果追蹤表
+
+```bash
+# test_status_tracker.sh - 追蹤測試狀態
+
+TRACKER_FILE="/tmp/test_status_tracker.txt"
+
+init_tracker() {
+    echo "=== 測試狀態追蹤 ===" > $TRACKER_FILE
+    echo "建立時間: $(date)" >> $TRACKER_FILE
+    echo "" >> $TRACKER_FILE
+    echo "| 測試情境 | 執行次數 | 通過次數 | 失敗次數 | 最後執行時間 | 狀態 |" >> $TRACKER_FILE
+    echo "|----------|----------|----------|----------|--------------|------|" >> $TRACKER_FILE
+}
+
+update_status() {
+    local TEST_NAME=$1
+    local RESULT=$2
+    local RUNS=1
+    local PASSES=0
+    local FAILS=0
+
+    if [ "$RESULT" = "PASS" ]; then
+        PASSES=1
+    else
+        FAILS=1
+    fi
+
+    echo "| $TEST_NAME | $RUNS | $PASSES | $FAILS | $(date) | $RESULT |" >> $TRACKER_FILE
+}
+
+show_status() {
+    cat $TRACKER_FILE
+}
+```
+
+### 5.9 常見問題與解決方式
+
+| 問題 | 可能原因 | 解決方式 |
+|------|----------|----------|
+| `pvecm status` 無回應 | bond0 雙鏈路中斷 | SSH 到其他節點檢查 |
+| HA 誤觸發 | Corosync deadtime 過短 | 調整至 10s |
+| 網路無法恢復 | bond 卡住 | `ip link set down && up` 重新觸發 LACP |
+| 成員消失但 quorum 還在 | ring1 備援生效 | 正常，檢查 ring0 狀態 |
+| Fence 一直觸發 | 網路持續不穩定 | 暫停測試，檢查交換機 |
+
+### 5.10 執行檢查清單
+
+```bash
+# 測試執行前檢查清單
+CHECKLIST="
+
+□ 1. 通知團隊即將執行測試（高風險）
+□ 2. 確認 VM 快照已建立
+□ 3. 確認其餘節點 SSH 可達
+□ 4. 確認監控系統已開啟
+□ 5. 記錄測試開始時間
+□ 6. 執行 cleanup_before_test.sh
+□ 7. 執行 health_check.sh
+□ 8. 確認所有檢查通過
+□ 9. 開始執行測試
+□ 10. 執行後還原網路設定
+□ 11. 執行 health_check.sh 確認恢復
+□ 12. 記錄測試結果
+
+"
+echo "$CHECKLIST"
+```
 
 ---
 
-## 6. 測試步驟
+## 7. 測試步驟
 
-### 6.1 準備階段
+### 7.1 準備階段
 
 ```bash
 # 檢查初始狀態
@@ -107,7 +474,7 @@ qm status 105
 # 預期輸出：status: running
 ```
 
-### 6.2 執行測試 — bond0 單鏈路故障（nic2）
+### 7.2 執行測試 — bond0 單鏈路故障（nic2）
 
 ```bash
 # 記錄測試前基數
@@ -165,7 +532,7 @@ cat /proc/net/bonding/bond0 | grep "MII Status"
 ssh root@172.23.0.172 "pvecm status"
 ```
 
-### 6.3 執行測試 — bond0 雙鏈路故障
+### 7.3 執行測試 — bond0 雙鏈路故障
 
 ```bash
 # 模擬 bond0 完全斷線
@@ -208,7 +575,7 @@ ssh root@172.23.0.172 "pvecm status"
 # 預期：Quorate: Yes，三節點恢復
 ```
 
-### 6.4 執行測試 — Corosync 管理網路隔離
+### 7.4 執行測試 — Corosync 管理網路隔離
 
 ```bash
 # 使用 iptables 阻斷與另一節點的通訊（模擬網路分割）
@@ -250,7 +617,7 @@ ssh root@172.23.0.173 "pvecm status"
 # 預期：三節點恢復
 ```
 
-### 6.5 執行測試 — 雙 Ring 同步中斷（真正 HA 測試）
+### 7.5 執行測試 — 雙 Ring 同步中斷（真正 HA 測試）
 
 ```bash
 # 同步阻斷 ring0 (172.19.0.x) 和 ring1 (10.23.0.x) 與 172.19.0.172 的通訊
@@ -304,9 +671,9 @@ ssh root@172.23.0.173 "pvecm status"
 
 ---
 
-## 7. 驗證步驟
+## 8. 驗證步驟
 
-### 7.1 檢查 bond 狀態
+### 8.1 檢查 bond 狀態
 
 ```bash
 # 驗證 bond0 流量分散
@@ -318,7 +685,7 @@ cat /proc/net/bonding/bond0 | grep -E "MII Status|Slave Interface|Link Failure"
 # 預期：MII Status: up, 兩個 Slave Link Failure Count 不再增加
 ```
 
-### 7.2 檢查 VM 連線
+### 8.2 檢查 VM 連線
 
 ```bash#
 # 驗證 VM 持續運行#
@@ -359,7 +726,7 @@ expect /tmp/vm105_io.exp 2>&1 | tail -5
 # 預期：完成無錯誤（100+0 records in/out）
 ```
 
-### 7.3 檢查 Corosync 狀態
+### 8.3 檢查 Corosync 狀態
 
 ```bash
 # =============================================
@@ -375,7 +742,7 @@ ssh root@172.23.0.173 "journalctl -u corosync --since '5 min ago' | grep -i 'err
 # 預期：無錯誤或僅有預期的 "link down" 訊息
 ```
 
-### 7.4 檢查 HA 狀態
+### 8.4 檢查 HA 狀態
 
 ```bash
 # =============================================
@@ -393,13 +760,13 @@ ssh root@172.23.0.173 "journalctl -u pve-ha-lrm --since '5 min ago' | grep -i 'e
 
 ---
 
-## 8. 交換機重啟模擬（使用 ip link down 雙鏈路）
+## 9. 交換機重啟模擬（使用 ip link down 雙鏈路）
 
-### 8.1 測試情境
+### 9.1 測試情境
 
 由於無 Switch 管理權限，使用 `ip link set down` 模擬交換機重啟（雙鏈路同時斷線）。
 
-### 8.2 測試步驟
+### 9.2 測試步驟
 
 ```bash
 # 記錄測試開始時間
@@ -424,7 +791,7 @@ echo "鏈路已恢復: $(date +%s)" >> /tmp/switch_reboot_test
 # ping -i 0.2 172.19.1.252 | grep "ttl="
 ```
 
-### 8.3 驗證步驟
+### 9.3 驗證步驟
 
 ```bash
 # 檢查 bond0 是否完全恢復
@@ -446,9 +813,9 @@ ssh root@172.23.0.172 "pvecm status"
 
 ---
 
-## 9. HA 敏感度調整建議
+## 10. HA 敏感度調整建議
 
-### 9.1 若 HA 非預期觸發
+### 10.1 若 HA 非預期觸發
 
 ```bash
 # 檢查當前 corosync 參數
@@ -473,7 +840,7 @@ corosync-cmapctl | grep -E 'deadtime|token'
 # 預期：顯示新設定值
 ```
 
-### 9.2 建議配置
+### 10.2 建議配置
 
 | 參數 | 預設值 | 保守值 | 說明 |
 |------|--------|--------|------|
@@ -481,7 +848,7 @@ corosync-cmapctl | grep -E 'deadtime|token'
 | token | 1000ms | 5000ms | 單一 token 循環時間 |
 | token_retransmits_before_loss_const | 4 | 10 | 重傳次數後判定 loss |
 
-### 9.3 Corosync 流量移至專用網段
+### 10.3 Corosync 流量移至專用網段
 
 **狀態：已實現**
 
@@ -495,9 +862,9 @@ corosync-cmapctl | grep -E 'deadtime|token'
 
 ---
 
-## 10. 測試結論
+## 11. 測試結論
 
-### 10.1 測試結果（2026-05-15 更新）
+### 11.1 測試結果（2026-05-15 更新）
 
 | 測試情境 | 通過/失敗 | HA 觸發 | 驗證方式 | 說明 |
 |----------|----------|---------|----------|------|
@@ -512,14 +879,14 @@ corosync-cmapctl | grep -E 'deadtime|token'
 
 > **注意**：所有涉及 bond0（管理網路）故障的測試，驗證指令必須從其他健康節點（如 172.23.0.172 或 172.23.0.173）執行，因為本機管理網路可能已中斷。
 
-### 10.2 關鍵發現
+### 11.2 關鍵發現
 
 1. **Corosync 雙 ring 設計正確運作**：ring1 (10.23.0.x) 為 ring0 (172.19.0.x) 提供備援
 2. **LACP 單鏈路故障**：切換時間 <0.2s，0 丟包，符合 SLA
 3. **bond0 雙鏈路故障**：不會導致叢集失效（因 ring1 備援）
 4. **真正 HA 測試**：需同步阻斷 ring0 + ring1
 
-### 10.3 後續行動
+### 11.3 後續行動
 
 - [ ] 執行「雙 Ring 同步中斷」測試以驗證 HA 觸發
 - [ ] 更新相關風險評估矩陣
