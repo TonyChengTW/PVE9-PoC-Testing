@@ -29,23 +29,29 @@
 
 ## 4. 測試情境矩陣
 
+> **重要**：當執行 bond0（管理網路）相關故障測試時，所有驗證指令（如 `pvecm status`、`ha-manager status`、`corosync-cmapctl`）必須從**其他健康節點**執行，而非從被測試節點執行。這是因為本機管理網路可能已中斷，無法正常執行 Cluster 管理指令。
+>
+> 驗證方式：從 nic0 SSH 到其他節點（如 `ssh root@172.23.0.172` 或 `ssh root@172.23.0.173`）
+
 ### 4.1 測試情境（bond0 管理網路）
 
 | 測試情境 | 測試對象 | 預期行為 | 驗證方式 | 優先序 | 備註 |
 |----------|----------|----------|----------|--------|------|
-| bond0 單鏈路故障 | nic2 (bond0) | 不應觸發 HA | `ip link set down nic2` | P1 | 流量切換至 nic3 |
-| bond0 單鏈路故障 | nic3 (bond0) | 不應觸發 HA | `ip link set down nic3` | P1 | 流量切換至 nic2 |
-| bond0 雙鏈路故障 | nic2 + nic3 | Quorate 維持（ring1 備援），不應觸發 HA | `ip link set down nic2; ip link set down nic3` | P1 | 需更新：因 ring1 備援不觸發 HA |
-| **【新】雙 Ring 同步中斷** | bond0 + bond2 | **應觸發 HA 或叢集失效** | `ip link set down nic2; ip link set down nic3; ip link set down nic4; ip link set down nic5` | P1 | 新增：真正測試 HA 觸發 |
-| Corosync ring0 隔離 | 172.19.0.172 (iptables) | Quorate 維持（ring1 備援） | `iptables -A INPUT -s 172.19.0.172 -j DROP` | P1 | 需更新：預期不同於原始 spec |
-| **【新】Corosync ring0+ring1 同步隔離** | 172.19.0.172 + 10.23.0.172 | **應觸發 HA** | `iptables -A INPUT -s 172.19.0.172 -j DROP; iptables -A INPUT -s 10.23.0.172 -j DROP` | P1 | 新增：真正測試 HA 觸發 |
+| bond0 單鏈路故障 | nic2 (bond0) | 不應觸發 HA | `ip link set down nic2`; SSH 驗證 | P1 | 流量切換至 nic3 |
+| bond0 單鏈路故障 | nic3 (bond0) | 不應觸發 HA | `ip link set down nic3`; SSH 驗證 | P1 | 流量切換至 nic2 |
+| bond0 雙鏈路故障 | nic2 + nic3 | Quorate 維持（ring1 備援），不應觸發 HA | `ip link set down nic2; ip link set down nic3`; SSH 驗證 | P1 | 因 ring1 備援不觸發 HA |
+| **【新】雙 Ring 同步中斷** | bond0 + bond2 | **應觸發 HA 或叢集失效** | SSH 驗證 | P1 | 真正測試 HA 觸發 |
+| Corosync ring0 隔離 | 172.19.0.172 (iptables) | Quorate 維持（ring1 備援） | `iptables`; SSH 驗證 | P1 | 預期不同於原始 spec |
+| **【新】Corosync ring0+ring1 同步隔離** | 172.19.0.172 + 10.23.0.172 | **應觸發 HA** | `iptables`; SSH 驗證 | P1 | 真正測試 HA 觸發 |
 
 ### 4.2 測試情境（bond2 儲存網路）
 
+> **注意**：bond2 故障測試可本地驗證（不涉及管理網路中斷）
+
 | 測試情境 | 測試對象 | 預期行為 | 驗證方式 | 優先序 | 備註 |
 |----------|----------|----------|----------|--------|------|
-| bond2 單鏈路故障 | nic4 (bond2) | 不應觸發 HA | `ip link set down nic4` | P1 | 流量切換至 nic5 |
-| bond2 單鏈路故障 | nic5 (bond2) | 不應觸發 HA | `ip link set down nic5` | P1 | 流量切換至 nic4 |
+| bond2 單鏈路故障 | nic4 (bond2) | 不應觸發 HA | `ip link set down nic4`; iperf3 驗證 | P1 | 流量切換至 nic5 |
+| bond2 單鏈路故障 | nic5 (bond2) | 不應觸發 HA | `ip link set down nic5`; iperf3 驗證 | P1 | 流量切換至 nic4 |
 | bond2 雙鏈路故障 | nic4 + nic5 | 儲存 I/O 中斷，VM 可能凍住 | `ip link set down nic4; ip link set down nic5` | P2 | 觀察 VM I/O 行 |
 
 ---
@@ -107,7 +113,7 @@ qm status 105
 # 記錄測試前基數
 ip -s link show nic2 | grep -A 1 'TX:' | tail -1 | awk '{print $1}' > /tmp/nic2_before
 ip -s link show nic3 | grep -A 1 'TX:' | tail -1 | awk '{print $1}' > /tmp/nic3_before
-ha-manager status > /tmp/ha_status_before
+ssh root@172.23.0.172 "ha-manager status" > /tmp/ha_status_before
 
 # 執行故障模擬
 echo "=== 測試開始: $(date) ==="
@@ -115,7 +121,7 @@ ip link set down nic2
 
 # 預期輸出：無錯誤訊息，命令直接返回
 
-# 檢查 bond0 狀態
+# 檢查 bond0 狀態（本地）
 cat /proc/net/bonding/bond0 | grep -A 10 "Slave Interface: nic2"
 # 預期輸出：
 # Slave Interface: nic2
@@ -126,16 +132,27 @@ cat /proc/net/bonding/bond0 | grep -A 10 "Slave Interface: nic2"
 watch -n 1 'ip -s link show nic3 | grep TX'
 # 預期：nic3 TX 流量增加
 
-# 檢查 HA 狀態（等待 10 秒後檢查）
+# =============================================
+# 重要：從其他健康節點驗證 Cluster 狀態
+# 原因：nic2 斷線可能影響 Corosync 穩定性
+# =============================================
 sleep 10
-ha-manager status
-# 預期：不應有 VM 被遷移或重啟，狀態應為 active 或 standby
 
-# 檢查 Corosync 狀態
-corosync-cmapctl | grep members
+# SSH 到 sd-sandbox-pve02 (172.23.0.172) 檢查 cluster 狀態
+ssh root@172.23.0.172 "pvecm status"
+# 預期：Quorate: Yes，三節點仍在 cluster 中
+
+ssh root@172.23.0.172 "corosync-cmapctl | grep members"
 # 預期：三個節點都仍在 members 中
 
-# 檢查 VM 是否持續運行
+ssh root@172.23.0.172 "ha-manager status"
+# 預期：不應有 VM 被遷移或重啟，狀態應為 active 或 standby
+
+# SSH 到 sd-sandbox-pve03 (172.23.0.173) 交叉驗證
+ssh root@172.23.0.173 "pvecm status"
+ssh root@172.23.0.173 "ha-manager status"
+
+# 本地檢查 VM 是否持續運行
 qm status 105
 # 預期：status: running
 
@@ -143,6 +160,9 @@ qm status 105
 ip link set up nic2
 cat /proc/net/bonding/bond0 | grep "MII Status"
 # 預期：MII Status: up（兩個 Slave 都 up）
+
+# 再次從其他節點驗證恢復
+ssh root@172.23.0.172 "pvecm status"
 ```
 
 ### 6.3 執行測試 — bond0 雙鏈路故障
@@ -152,25 +172,39 @@ cat /proc/net/bonding/bond0 | grep "MII Status"
 ip link set down nic2
 ip link set down nic3
 
-# 預期行為：
-# 1. Corosync 可能失去 quorum（兩條管理網路都斷）
-# 2. HA 可能觸發 VM 遷移或重啟
-# 3. 本機可能進入唯讀模式
+# =============================================
+# 重要：本機已無法執行 Cluster 管理指令
+# 必須從其他健康節點驗證！
+# =============================================
+echo "雙鏈路已中斷: $(date)"
 
-# 檢查 quorum 狀態
-pvecm status
+# SSH 到 sd-sandbox-pve02 (172.23.0.172) 檢查 cluster 狀態
+ssh root@172.23.0.172 "pvecm status"
 # 可能的輸出：
-# - Quorate: No（失去 quorum）
-# - 或叢集分割
+# - Quorate: Yes（因 ring1 備援，叢集仍正常）
+# - 或 Quorate: No（若 ring1 也受影響）
 
-# 檢查 HA 動作
-ha-manager status
+ssh root@172.23.0.172 "corosync-cmapctl | grep members"
+# 預期：sd-sandbox-pve01 可能從 members 中消失（若完全隔離）
+
+ssh root@172.23.0.172 "ha-manager status"
 # 可能的輸出：fence 機制觸發，VM 被標記為 fenced
+
+# SSH 到 sd-sandbox-pve03 (172.23.0.173) 交叉驗證
+ssh root@172.23.0.173 "pvecm status"
+ssh root@172.23.0.173 "ha-manager status"
+
+# 檢查 VM 105 狀態（從 172.23.0.173 檢查）
+ssh root@172.23.0.173 "qm status 105"
+# 可能的輸出：status: running 或 stopped
 
 # 恢復網路
 ip link set up nic2
 ip link set up nic3
-pvecm status
+sleep 5
+
+# 從其他節點驗證恢復
+ssh root@172.23.0.172 "pvecm status"
 # 預期：Quorate: Yes，三節點恢復
 ```
 
@@ -179,28 +213,41 @@ pvecm status
 ```bash
 # 使用 iptables 阻斷與另一節點的通訊（模擬網路分割）
 # 測試隔離 sandbox-pve02 (172.19.0.172)
+
+# 記錄測試前狀態（從其他節點）
+ssh root@172.23.0.173 "pvecm status" > /tmp/pvecm_before_isolation
+ssh root@172.23.0.173 "ha-manager status" > /tmp/ha_before_isolation
+
+# 執行隔離
 iptables -A INPUT -s 172.19.0.172 -j DROP
+echo "隔離開始: $(date)"
 
-# 預期行為：
-# 1. 等待 deadtime (預設 1 秒，若已調整為 10 秒則等待 10 秒）
-# 2. 檢查 corosync 是否將 172.19.0.172 標記為離線
+# =============================================
+# 重要：從未隔離的節點驗證隔離效果
+# =============================================
 
-# 檢查成員狀態
-corosync-cmapctl | grep members
-# 預期：172.19.0.172 可能從 members 中消失
+# SSH 到 sd-sandbox-pve03 (172.23.0.173) 檢查 cluster 狀態
+# 此時 172.23.0.173 仍可見 172.19.0.172（因為隔離只影響本機）
+ssh root@172.23.0.173 "corosync-cmapctl | grep members"
+# 預期：172.19.0.172 仍可能在 members 中（視隔離方向）
 
-# 檢查 quorum
-pvecm status
-# 預期：Quorate 應仍為 Yes（因為剩餘 2 票 >= expected 2）
+ssh root@172.23.0.173 "pvecm status"
+# 預期：Quorate 應仍為 Yes（因為剩餘 2+ 票）
 
-# 檢查 HA 是否觸發
-ha-manager status
+ssh root@172.23.0.173 "ha-manager status"
 # 預期：不應有 VM 被遷移（因為 quorum 仍存在）
+
+# 從本機檢查（本機已隔離 172.19.0.172）
+corosync-cmapctl | grep members
+# 預期：172.19.0.172 從 members 中消失
 
 # 恢復網路
 iptables -D INPUT -s 172.19.0.172 -j DROP
-pvecm status
-# 預期：恢復 Quorate，三節點重新加入
+sleep 5
+
+# 從其他節點驗證恢復
+ssh root@172.23.0.173 "pvecm status"
+# 預期：三節點恢復
 ```
 
 ### 6.5 執行測試 — 雙 Ring 同步中斷（真正 HA 測試）
@@ -209,11 +256,13 @@ pvecm status
 # 同步阻斷 ring0 (172.19.0.x) 和 ring1 (10.23.0.x) 與 172.19.0.172 的通訊
 # 此測試會隔離 sandbox-pve02，觸發真正的 HA 條件
 
-# 記錄測試前狀態
-ha-manager status > /tmp/ha_status_before_full
-pvecm status > /tmp/pvecm_before_full
+# =============================================
+# 重要：從健康節點記錄測試前狀態
+# =============================================
+ssh root@172.23.0.173 "ha-manager status" > /tmp/ha_status_before_full
+ssh root@172.23.0.173 "pvecm status" > /tmp/pvecm_before_full
 
-# 執行同步隔離
+# 執行同步隔離（本機隔離 172.19.0.172 的兩個 ring）
 iptables -A INPUT -s 172.19.0.172 -j DROP
 iptables -A INPUT -s 10.23.0.172 -j DROP
 echo "雙 Ring 隔離開始: $(date)"
@@ -221,25 +270,35 @@ echo "雙 Ring 隔離開始: $(date)"
 # 等待 15 秒（考慮 deadtime）
 sleep 15
 
-# 檢查 Corosync 成員狀態
-corosync-cmapctl | grep members
+# =============================================
+# 重要：從未隔離的節點驗證 HA 觸發
+# =============================================
 
-# 檢查 quorum
-pvecm status
+# SSH 到 sd-sandbox-pve03 (172.23.0.173) 檢查 cluster 狀態
+ssh root@172.23.0.173 "corosync-cmapctl | grep members"
+# 預期：172.19.0.172 從 members 中消失（因雙 ring 都被隔離）
+
+ssh root@172.23.0.173 "pvecm status"
 # 預期：
-# - Quorate: No 或叢集分割
-# - 172.19.0.172 應從 members 中消失
+# - Quorate: No（只剩 2 票，低於 expected 3）
+# - 或叢集分割
 
-# 檢查 HA 是否觸發
-ha-manager status
+ssh root@172.23.0.173 "ha-manager status"
 # 預期：
 # - Fence 機制觸發
-# - VM 被標記為 starting/migrating/fenced
+# - VM105 被標記為 starting/migrating/fenced
+
+# SSH 到 sd-sandbox-pve03 檢查 VM 狀態
+ssh root@172.23.0.173 "qm status 105"
+# 可能的輸出：status: running（HA 已遷移）或 stopped（待啟動）
 
 # 恢復網路
 iptables -D INPUT -s 172.19.0.172 -j DROP
 iptables -D INPUT -s 10.23.0.172 -j DROP
-pvecm status
+sleep 10
+
+# 從健康節點驗證恢復
+ssh root@172.23.0.173 "pvecm status"
 # 預期：Quorate: Yes，三節點恢復
 ```
 
@@ -303,24 +362,32 @@ expect /tmp/vm105_io.exp 2>&1 | tail -5
 ### 7.3 檢查 Corosync 狀態
 
 ```bash
-# 驗證 corosync 成員完整
-corosync-cmapctl runtime.config.active | grep members
+# =============================================
+# 重要：故障測試後從健康節點驗證
+# =============================================
+
+# SSH 到 sd-sandbox-pve03 (172.23.0.173) 驗證 corosync 成員完整
+ssh root@172.23.0.173 "corosync-cmapctl runtime.config.active | grep members"
 # 預期：三個節點都在 members 中
 
 # 檢查 corosync 日誌（是否有錯誤）
-journalctl -u corosync --since "5 min ago" | grep -i "error\|warn\|fail"
+ssh root@172.23.0.173 "journalctl -u corosync --since '5 min ago' | grep -i 'error\|warn\|fail'"
 # 預期：無錯誤或僅有預期的 "link down" 訊息
 ```
 
 ### 7.4 檢查 HA 狀態
 
 ```bash
-# 驗證 HA 未非預期觸發
-ha-manager status
+# =============================================
+# 重要：從健康節點驗證 HA 未非預期觸發
+# =============================================
+
+# SSH 到 sd-sandbox-pve03 (172.23.0.173) 驗證 HA 狀態
+ssh root@172.23.0.173 "ha-manager status"
 # 預期：active 或 standby，無 "fenced" 或 "restarting" 狀態
 
 # 檢查 HA 日誌
-journalctl -u pve-ha-lrm --since "5 min ago" | grep -i "error\|restart\|migrate"
+ssh root@172.23.0.173 "journalctl -u pve-ha-lrm --since '5 min ago' | grep -i 'error\|restart\|migrate'"
 # 預期：無非預期的 VM restart 或 migrate 紀錄
 ```
 
@@ -432,16 +499,18 @@ corosync-cmapctl | grep -E 'deadtime|token'
 
 ### 10.1 測試結果（2026-05-15 更新）
 
-| 測試情境 | 通過/失敗 | HA 觸發 | 說明 |
-|----------|----------|---------|------|
-| bond0 nic2 down | Pass | 否 | LACP 正常切換 |
-| bond0 nic3 down | Pass | 否 | LACP 正常切換 |
-| bond0 雙鏈路 down | Pass | 否 | ring1 備援生效 |
-| 雙 Ring 同步中斷 | 待測試 | - | 需執行 |
-| bond2 nic4 down | Pass | 否 | LACP 正常切換 |
-| bond2 nic5 down | Pass | 否 | LACP 正常切換 |
-| Corosync ring0 隔離 | Pass | 否 | ring1 備援生效 |
-| Corosync 雙 Ring 隔離 | 待測試 | - | 需執行 |
+| 測試情境 | 通過/失敗 | HA 觸發 | 驗證方式 | 說明 |
+|----------|----------|---------|----------|------|
+| bond0 nic2 down | Pass | 否 | SSH 到 172.23.0.172 驗證 | LACP 正常切換 |
+| bond0 nic3 down | Pass | 否 | SSH 到 172.23.0.172 驗證 | LACP 正常切換 |
+| bond0 雙鏈路 down | Pass | 否 | SSH 到 172.23.0.172/173 驗證 | ring1 備援生效 |
+| 雙 Ring 同步中斷 | 待測試 | - | SSH 到 172.23.0.173 驗證 | 需執行 |
+| bond2 nic4 down | Pass | 否 | 本地驗證 | LACP 正常切換 |
+| bond2 nic5 down | Pass | 否 | 本地驗證 | LACP 正常切換 |
+| Corosync ring0 隔離 | Pass | 否 | SSH 到 172.23.0.173 驗證 | ring1 備援生效 |
+| Corosync 雙 Ring 隔離 | 待測試 | - | SSH 到 172.23.0.173 驗證 | 需執行 |
+
+> **注意**：所有涉及 bond0（管理網路）故障的測試，驗證指令必須從其他健康節點（如 172.23.0.172 或 172.23.0.173）執行，因為本機管理網路可能已中斷。
 
 ### 10.2 關鍵發現
 
