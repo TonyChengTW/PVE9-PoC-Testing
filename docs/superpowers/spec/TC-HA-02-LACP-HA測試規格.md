@@ -440,7 +440,7 @@ qm status 105
 # 預期：status: running
 
 # 檢查 Corosync
-pvecm status
+ssh root@172.23.0.172 "pvecm status"
 # 預期：Quorate: Yes
 ```
 
