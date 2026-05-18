@@ -136,6 +136,11 @@ help:
 	@echo "  make rollback-to-phase1  # 回滾到健康檢查"
 	@echo "  make rollback-to-phase2  # 回滾到 Phase 2 HA測試"
 	@echo ""
+	@echo "## Watchdog 管理（測試環境）"
+	@echo "  make watchdog-stop   # 停用 watchdog-mux（防止 test-ha-dual-ring 觸發重開機）"
+	@echo "  make watchdog-start  # 恢復 watchdog-mux"
+	@echo "  make watchdog-status  # 檢查 watchdog-mux 狀態"
+	@echo ""
 	@echo "========================================"
 
 # ==============================================================================
@@ -152,8 +157,33 @@ cleanup:
 	@sleep 3
 	@$(call LOG,"清理完成")
 
+.PHONY: watchdog-stop
+watchdog-stop:
+	@echo "[Watchdog] 停用 watchdog-mux（僅測試環境）..."
+	@# 重要：先安撫硬體 watchdog，否則直接停止服務會導致 60 秒後系統重開機
+	@watchdog -D /dev/watchdog0 2>/dev/null || true
+	@systemctl stop watchdog-mux 2>/dev/null || true
+	@ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_1) "watchdog -D /dev/watchdog0 2>/dev/null || true; systemctl stop watchdog-mux 2>/dev/null" || echo "172 watchdog 停用失敗"
+	@ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_2) "watchdog -D /dev/watchdog0 2>/dev/null || true; systemctl stop watchdog-mux 2>/dev/null" || echo "173 watchdog 停用失敗"
+	@echo "[Watchdog] 已停用所有節點的 watchdog-mux"
+
+.PHONY: watchdog-start
+watchdog-start:
+	@echo "[Watchdog] 恢復 watchdog-mux..."
+	@systemctl start watchdog-mux 2>/dev/null || true
+	@ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_1) "systemctl start watchdog-mux 2>/dev/null" || echo "172 watchdog 恢復失敗"
+	@ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_2) "systemctl start watchdog-mux 2>/dev/null" || echo "173 watchdog 恢復失敗"
+	@echo "[Watchdog] 已恢復所有節點的 watchdog-mux"
+
+.PHONY: watchdog-status
+watchdog-status:
+	@echo "[Watchdog] 檢查各節點 watchdog-mux 狀態..."
+	@echo "=== Local (172.23.0.171) ===" && systemctl is-active watchdog-mux || echo "stopped"
+	@echo "=== Node 1 (172.23.0.172) ===" && ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_1) "systemctl is-active watchdog-mux" || echo "stopped or unreachable"
+	@echo "=== Node 2 (172.23.0.173) ===" && ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_2) "systemctl is-active watchdog-mux" || echo "stopped or unreachable"
+
 .PHONY: reset
-reset: cleanup
+reset: cleanup watchdog-start
 	@$(call LOG,"執行 Reset - 強制恢復所有介面")
 	@ip link set up $(ALL_NICS) 2>/dev/null || true
 	@iptables -P INPUT ACCEPT; iptables -F 2>/dev/null || true
@@ -288,18 +318,14 @@ test-ha-dual-ring:
 	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status; echo 'NODE2:'; qm status $(VM_ID)" 2>&1 | tee -a $(LOG_DIR)/test.log
 	@VM_BEFORE=$$(ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "ha-manager status 2>/dev/null" | grep "vm:$(VM_ID)" | awk '{print $$2}' | tr -d ','); echo "VM 隔離前位置: $$VM_BEFORE" | tee -a $(LOG_DIR)/test.log
 	@echo "" | tee -a $(LOG_DIR)/test.log
-	@echo "=== Phase 2: 故障注入 - 在 172 和 173 上封鎖叢集網段 ===" | tee -a $(LOG_DIR)/test.log
+	@echo "=== Phase 2: 故障注入 - 在所有節點封鎖叢集網段 (5秒) ===" | tee -a $(LOG_DIR)/test.log
 	@iptables -P INPUT ACCEPT
-	$(call LOG,"本地iptables: iptables -A INPUT -s 172.19.0.172 -j DROP")
-	@iptables -A INPUT -s 172.19.0.172 -j DROP
-	$(call LOG,"本地iptables: iptables -A INPUT -s 10.23.0.172 -j DROP")
-	@iptables -A INPUT -s 10.23.0.172 -j DROP
-	$(call LOG,"在 172.23.0.172 遠端封鎖 172.19.0.x")
+	@iptables -A INPUT -s 172.19.0.172 -j DROP 2>&1 | tee -a $(LOG_DIR)/test.log
+	@iptables -A INPUT -s 10.23.0.172 -j DROP 2>&1 | tee -a $(LOG_DIR)/test.log
 	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "iptables -P INPUT ACCEPT; iptables -A INPUT -s 172.19.0.173 -j DROP; iptables -A INPUT -s 10.23.0.173 -j DROP" 2>&1 | tee -a $(LOG_DIR)/test.log || echo "遠端封鎖失敗" | tee -a $(LOG_DIR)/test.log
-	$(call LOG,"在 172.23.0.173 遠端封鎖 172.19.0.x")
 	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "iptables -P INPUT ACCEPT; iptables -A INPUT -s 172.19.0.172 -j DROP; iptables -A INPUT -s 10.23.0.172 -j DROP" 2>&1 | tee -a $(LOG_DIR)/test.log || echo "遠端封鎖失敗" | tee -a $(LOG_DIR)/test.log
-	@echo "等待 15 秒讓 Corosync 檢測失效..." | tee -a $(LOG_DIR)/test.log
-	@sleep 15
+	@echo "等待 20 秒讓 Corosync 檢測失效（watchdog timeout 約 30 秒，安全）..." | tee -a $(LOG_DIR)/test.log
+	@sleep 20
 	@echo "" | tee -a $(LOG_DIR)/test.log
 	@echo "=== Phase 3: 隔離後 - 驗證叢集狀態 ===" | tee -a $(LOG_DIR)/test.log
 	@echo "--- 從 173 驗證 (SSH 仍可達) ---" | tee -a $(LOG_DIR)/test.log
@@ -307,7 +333,7 @@ test-ha-dual-ring:
 	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status 2>&1" | tee -a $(LOG_DIR)/test.log
 	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "qm status $(VM_ID) 2>&1" | tee -a $(LOG_DIR)/test.log
 	@sleep 2
-	@echo "--- 嘗試從 172 驗證 (預期可能失敗) ---" | tee -a $(LOG_DIR)/test.log
+	@echo "--- 從 172 驗證 (可能被隔離) ---" | tee -a $(LOG_DIR)/test.log
 	@ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_1) "pvecm status 2>&1" | tee -a $(LOG_DIR)/test.log || echo "172 SSH 連線失敗或超時" | tee -a $(LOG_DIR)/test.log
 	@sleep 2
 	@VM_AFTER=$$(ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status 2>/dev/null" | grep "vm:$(VM_ID)" | awk '{print $$2}' | tr -d ','); echo "VM 隔離後位置: $$VM_AFTER" | tee -a $(LOG_DIR)/test.log
@@ -482,6 +508,8 @@ rollback-to-phase2:
 rollback-to-phase3:
 	@$(call LOG,"回滾到 Phase 3 頻寬測試")
 	@make cleanup
+	@make health-check�到 Phase 3 頻寬測試")
+	@make cleanup
 	@make health-check
 
 # ==============================================================================
@@ -490,6 +518,9 @@ rollback-to-phase3:
 
 .PHONY: status
 status:
+	@python3 $(PYTHON_STATUS) show
+
+.PHONus:
 	@python3 $(PYTHON_STATUS) show
 
 .PHONY: history
