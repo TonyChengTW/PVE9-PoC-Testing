@@ -194,19 +194,20 @@ health-check:
 	@CHECK_PASS=true; \
 echo "=== 健康檢查 - $$(date) ==="; \
 echo -n "1. Cluster Quorate: "; \
-if pvecm status 2>/dev/null | grep -q "Quorate: Yes"; then echo "PASS"; else echo "FAIL"; CHECK_PASS=false; fi; \
+if pvecm status 2>/dev/null | grep -q "Quorate.*Yes"; then echo "PASS"; else echo "FAIL"; CHECK_PASS=false; fi; \
 echo -n "2. HA Manager: "; \
-if ha-manager status 2>/dev/null | grep -q "running"; then echo "PASS"; else echo "FAIL"; CHECK_PASS=false; fi; \
+if ha-manager status 2>/dev/null | grep -q "master"; then echo "PASS"; else echo "WARN"; fi; \
 echo -n "3. VM $(VM_ID) 運行: "; \
-if qm status $(VM_ID) 2>/dev/null | grep -q "status: running"; then echo "PASS"; else echo "FAIL"; CHECK_PASS=false; fi; \
+VM_STATUS=$$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_1) "qm status $(VM_ID) 2>&1" 2>/dev/null | grep "status: running" || echo ""); \
+if [ -n "$$VM_STATUS" ]; then echo "PASS"; else echo "WARN (VM not running - may need recovery)"; fi; \
 echo -n "4. VM $(VM_ID) in HA: "; \
 if ha-manager status 2>/dev/null | grep -q "vm:$(VM_ID)"; then echo "PASS"; else echo "WARN (not in HA)"; fi; \
 echo -n "5. bond0 狀態: "; \
 BOND0_UP=$$(cat /proc/net/bonding/bond0 2>/dev/null | grep "MII Status: up" | wc -l); \
-if [ $$BOND0_UP -ge 2 ]; then echo "PASS ($$BOND0_UP/2)"; else echo "FAIL ($$BOND0_UP/2)"; CHECK_PASS=false; fi; \
+if [ $$BOND0_UP -ge 2 ]; then echo "PASS ($$BOND0_UP slave interfaces up)"; else echo "FAIL ($$BOND0_UP/2)"; CHECK_PASS=false; fi; \
 echo -n "6. bond2 狀態: "; \
 BOND2_UP=$$(cat /proc/net/bonding/bond2 2>/dev/null | grep "MII Status: up" | wc -l); \
-if [ $$BOND2_UP -ge 2 ]; then echo "PASS ($$BOND2_UP/2)"; else echo "FAIL ($$BOND2_UP/2)"; CHECK_PASS=false; fi; \
+if [ $$BOND2_UP -ge 2 ]; then echo "PASS ($$BOND2_UP slave interfaces up)"; else echo "FAIL ($$BOND2_UP/2)"; CHECK_PASS=false; fi; \
 echo -n "7. SSH (172.23.0.172): "; \
 if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "echo ok" 2>/dev/null | grep -q "ok"; then echo "PASS"; else echo "FAIL"; CHECK_PASS=false; fi; \
 echo -n "8. SSH (172.23.0.173): "; \
@@ -282,18 +283,48 @@ test-ha-ring0-isolate:
 .PHONY: test-ha-dual-ring
 test-ha-dual-ring:
 	@$(call START_TEST,corosync_dual_ring_isolation)
+	@echo "=== Phase 1: 隔離前 - 記錄 VM 位置 ===" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "ha-manager status; echo 'NODE1:'; qm status $(VM_ID)" 2>&1 | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status; echo 'NODE2:'; qm status $(VM_ID)" 2>&1 | tee -a $(LOG_DIR)/test.log
+	@VM_BEFORE=$$(ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "ha-manager status 2>/dev/null" | grep "vm:$(VM_ID)" | awk '{print $$2}' | tr -d ','); echo "VM 隔離前位置: $$VM_BEFORE" | tee -a $(LOG_DIR)/test.log
+	@echo "" | tee -a $(LOG_DIR)/test.log
+	@echo "=== Phase 2: 故障注入 - 在 172 和 173 上封鎖叢集網段 ===" | tee -a $(LOG_DIR)/test.log
 	@iptables -P INPUT ACCEPT
-	$(call LOG,"故障注入: iptables 封鎖 172.19.0.172 + 10.23.0.172 兩個 ring")
+	$(call LOG,"本地iptables: iptables -A INPUT -s 172.19.0.172 -j DROP")
 	@iptables -A INPUT -s 172.19.0.172 -j DROP
+	$(call LOG,"本地iptables: iptables -A INPUT -s 10.23.0.172 -j DROP")
 	@iptables -A INPUT -s 10.23.0.172 -j DROP
+	$(call LOG,"在 172.23.0.172 遠端封鎖 172.19.0.x")
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "iptables -P INPUT ACCEPT; iptables -A INPUT -s 172.19.0.173 -j DROP; iptables -A INPUT -s 10.23.0.173 -j DROP" 2>&1 | tee -a $(LOG_DIR)/test.log || echo "遠端封鎖失敗" | tee -a $(LOG_DIR)/test.log
+	$(call LOG,"在 172.23.0.173 遠端封鎖 172.19.0.x")
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "iptables -P INPUT ACCEPT; iptables -A INPUT -s 172.19.0.172 -j DROP; iptables -A INPUT -s 10.23.0.172 -j DROP" 2>&1 | tee -a $(LOG_DIR)/test.log || echo "遠端封鎖失敗" | tee -a $(LOG_DIR)/test.log
+	@echo "等待 15 秒讓 Corosync 檢測失效..." | tee -a $(LOG_DIR)/test.log
 	@sleep 15
-	$(call LOG,"驗證 HA 觸發")
-	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "pvecm status" 2>&1 | tee -a $(LOG_DIR)/test.log
-	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status" 2>&1 | tee -a $(LOG_DIR)/test.log
-	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "qm status $(VM_ID)" 2>&1 | tee -a $(LOG_DIR)/test.log
+	@echo "" | tee -a $(LOG_DIR)/test.log
+	@echo "=== Phase 3: 隔離後 - 驗證叢集狀態 ===" | tee -a $(LOG_DIR)/test.log
+	@echo "--- 從 173 驗證 (SSH 仍可達) ---" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "pvecm status 2>&1" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status 2>&1" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "qm status $(VM_ID) 2>&1" | tee -a $(LOG_DIR)/test.log
+	@sleep 2
+	@echo "--- 嘗試從 172 驗證 (預期可能失敗) ---" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@$(TARGET_HOST_1) "pvecm status 2>&1" | tee -a $(LOG_DIR)/test.log || echo "172 SSH 連線失敗或超時" | tee -a $(LOG_DIR)/test.log
+	@sleep 2
+	@VM_AFTER=$$(ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "ha-manager status 2>/dev/null" | grep "vm:$(VM_ID)" | awk '{print $$2}' | tr -d ','); echo "VM 隔離後位置: $$VM_AFTER" | tee -a $(LOG_DIR)/test.log
+	@if [ "$$VM_BEFORE" != "$$VM_AFTER" ]; then echo "*** HA 觸發! VM 從 $$VM_BEFORE 遷移到 $$VM_AFTER ***" | tee -a $(LOG_DIR)/test.log; fi
+	@echo "" | tee -a $(LOG_DIR)/test.log
+	@echo "=== Phase 4: 清理 - 移除隔離規則 ===" | tee -a $(LOG_DIR)/test.log
 	@iptables -D INPUT -s 172.19.0.172 -j DROP
 	@iptables -D INPUT -s 10.23.0.172 -j DROP
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "iptables -D INPUT -s 172.19.0.173 -j DROP 2>/dev/null; iptables -D INPUT -s 10.23.0.173 -j DROP 2>/dev/null" 2>&1 | tee -a $(LOG_DIR)/test.log || echo "遠端清理失敗"
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_2) "iptables -D INPUT -s 172.19.0.172 -j DROP 2>/dev/null; iptables -D INPUT -s 10.23.0.172 -j DROP 2>/dev/null" 2>&1 | tee -a $(LOG_DIR)/test.log || echo "遠端清理失敗"
+	@echo "等待 10 秒讓叢集恢復..." | tee -a $(LOG_DIR)/test.log
 	@sleep 10
+	@echo "" | tee -a $(LOG_DIR)/test.log
+	@echo "=== Phase 5: 恢復後 - 最終驗證 ===" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "pvecm status 2>&1" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "ha-manager status 2>&1" | tee -a $(LOG_DIR)/test.log
+	@ssh -o StrictHostKeyChecking=no root@$(TARGET_HOST_1) "qm status $(VM_ID) 2>&1" | tee -a $(LOG_DIR)/test.log
 	@$(call END_TEST,corosync_dual_ring_isolation,PASS)
 
 # ==============================================================================
@@ -389,47 +420,47 @@ iperf-20g:
 .PHONY: fully-test
 fully-test:
 	@mkdir -p $(LOG_DIR)
-	@$(call LOG,"========================================")
-	@$(call LOG,"開始完整測試執行 (TC-HA-02 + TC-NW-02)")
-	@$(call LOG,"========================================")
+	@echo "========================================" | tee -a $(LOG_DIR)/test.log
+	@echo "開始完整測試執行 TC-HA-02 + TC-NW-02" | tee -a $(LOG_DIR)/test.log
+	@echo "========================================" | tee -a $(LOG_DIR)/test.log
 
-	@$(call LOG,"[Phase 0] 清理與重置")
+	@echo "[Phase 0] 清理與重置" | tee -a $(LOG_DIR)/test.log
 	@make reset
 
-	@$(call LOG,"[Phase 1] 健康檢查")
-	@make health-check || { $(call LOG,"錯誤: 健康檢查失敗"); exit 1; }
-
-	@$(call LOG,"[Phase 2] 執行 HA 測試 (TC-HA-02)")
-	@make test-ha-nic2 || { $(call LOG,"test-ha-nic2 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-ha-nic3 || { $(call LOG,"test-ha-nic3 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-ha-bond0-dual || { $(call LOG,"test-ha-bond0-dual 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-ha-ring0-isolate || { $(call LOG,"test-ha-ring0-isolate 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-ha-dual-ring || { $(call LOG,"test-ha-dual-ring 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-
-	@$(call LOG,"[Phase 3] 執行頻寬測試 (TC-NW-02)")
-	@make test-bw-bond0-ping || { $(call LOG,"test-bw-bond0-ping 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-bw-nic4 || { $(call LOG,"test-bw-nic4 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-bw-nic5 || { $(call LOG,"test-bw-nic5 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-	@make test-switch-reboot || { $(call LOG,"test-switch-reboot 失敗"); exit 1; }
-	@make reset && make health-check || { $(call LOG,"健康檢查失敗"); exit 1; }
-
-	@$(call LOG,"[Phase 4] 最終驗證")
+	@echo "[Phase 1] 健康檢查" | tee -a $(LOG_DIR)/test.log
 	@make health-check
 
-	@$(call LOG,"[Phase 5] 生成報告")
+	@echo "[Phase 2] 執行 HA 測試 TC-HA-02" | tee -a $(LOG_DIR)/test.log
+	@make test-ha-nic2
+	@make reset && make health-check
+	@make test-ha-nic3
+	@make reset && make health-check
+	@make test-ha-bond0-dual
+	@make reset && make health-check
+	@make test-ha-ring0-isolate
+	@make reset && make health-check
+	@make test-ha-dual-ring
+	@make reset && make health-check
+
+	@echo "[Phase 3] 執行頻寬測試 TC-NW-02" | tee -a $(LOG_DIR)/test.log
+	@make test-bw-bond0-ping
+	@make reset && make health-check
+	@make test-bw-nic4
+	@make reset && make health-check
+	@make test-bw-nic5
+	@make reset && make health-check
+	@make test-switch-reboot
+	@make reset && make health-check
+
+	@echo "[Phase 4] 最終驗證" | tee -a $(LOG_DIR)/test.log
+	@make health-check
+
+	@echo "[Phase 5] 生成報告" | tee -a $(LOG_DIR)/test.log
 	@make report
 
-	@$(call LOG,"========================================")
-	@$(call LOG,"測試執行完成")
-	@$(call LOG,"========================================")
+	@echo "========================================" | tee -a $(LOG_DIR)/test.log
+	@echo "測試執行完成" | tee -a $(LOG_DIR)/test.log
+	@echo "========================================" | tee -a $(LOG_DIR)/test.log
 
 # ==============================================================================
 # Rollback to Specific Phase

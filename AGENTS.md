@@ -50,6 +50,88 @@ make report                  # 生成 Markdown 報告
 - 這些測試需要在 INPUT Policy 為 ACCEPT 的狀態下執行
 - 生產環境建議使用交換機埠隔離而非 host 層級 iptables
 
+### Watchdog 導致節點重開機問題 (重要)
+
+**問題描述**：
+執行 `test-ha-dual-ring`（Corosync 雙 ring 隔離）時，若隔離時間超過閾值，節點會被 watchdog 機制重開機。這不是 kernel panic 或硬體故障，是 Proxmox 的保護機制。
+
+**觀測到的事件時間線**（2026-05-15 17:43）：
+
+| 時間 | 事件 |
+|------|------|
+| 17:43:16 | Corosync 開始重組，形成 2 節點成員 |
+| 17:43:17-43:35 | `pmxcfs` 服務不斷重試訊息發送（cpg_send_message）均失敗 |
+| 17:43:24 | iperf3 服務重啟計數已達 179 次 |
+| 17:43:34 | `watchdog-mux` 報告 client watchdog 過期 |
+| 17:43:35 | watchdog 進程退出，journal 同步完成 |
+| 17:43:43 | 系統被 watchdog 機制重開機 |
+
+**日誌關鍵片段**：
+```
+May 15 17:43:29 sd-sandbox-pve02 pmxcfs[1892]: [status] crit: cpg_send_message failed: CS_ERR_TRY_AGAIN
+May 15 17:43:33 sd-sandbox-pve02 pve-ha-crm[3431]: status change wait_for_quorum => slave
+May 15 17:43:34 sd-sandbox-pve02 watchdog-mux[1651]: client watchdog expired - disable watchdog updates
+May 15 17:43:34 sd-sandbox-pve02 watchdog-mux[1651]: exit watchdog-mux with active connections
+May 15 17:43:35 sd-sandbox-pve02 kernel: watchdog: watchdog0: watchdog did not stop!
+May 15 17:43:43 sd-sandbox-pve02 systemd[1]: watchdog-mux.service: Deactivated successfully.
+```
+
+**根本原因**：
+1. `test-ha-dual-ring` 在本地和遠端同時加 iptables 規則，封鎖 172.19.0.172 和 10.23.0.172
+2. 這導致 Corosync 完全無法通訊，叢集成員只能維持 2 節點
+3. `pmxcfs`（叢集配置文件系統）持續嘗試同步但失敗
+4. Proxmox 的 watchdog-mux 服務監控關鍵進程（pmxcfs, corosync 等）
+5. 當進程在設定時間內無回應，watchdog 觸發系統重開機
+
+**影響範圍**：
+- 受影響節點：172.23.0.172（sd-sandbox-pve02）
+- 叢集其他節點不受影響，仍維持運作
+- **正向觀察**：VM 105 確實因 HA 機制Failover 到 172.23.0.171（pve01），證明 HA 功能正常
+
+**防範措施**：
+
+1. **縮短隔離時間**
+   - 將 `test-ha-dual-ring` 的隔離等待時間從 15 秒減少到 **5-8 秒**
+   - 足夠觸發 HA 判定但不超過 watchdog timeout
+
+2. **測試前停用 watchdog（不建議在生產環境）**
+   ```bash
+   systemctl stop watchdog-mux
+   ```
+
+3. **增加 watchdog timeout**
+   ```bash
+   # 查看當前設定
+   systemctl show watchdog-mux
+   # 或修改 /etc/systemd/system/watchdog-mux.service.d/override.conf
+   ```
+
+4. **改用交換機層級隔離**
+   - 避免在 host 層級使用 iptables 模擬網路隔離
+   - 使用交換機的 SPAN/RSPAN 或 BPDU Guard 功能更接近真實故障場景
+
+**如何區分 Watchdog 重開機 vs Kernel Panic**：
+
+| 特徵 | Watchdog 重開機 | Kernel Panic |
+|------|----------------|--------------|
+| syslog 最後訊息 | `watchdog-mux: client watchdog expired` | `Kernel panic - not syncing` |
+| uptime | 通常幾分鐘內（因為迅速重啟） | 可能是任何時間 |
+| dmesg | 正常開機流程（bonding 初始化等） | 會有 oops/panic stack trace |
+| 重開機頻率 | 每次觸發條件相同都會 | 通常只一次（除非持續問題）|
+
+**驗證方法**：
+```bash
+# 列出開機記錄
+journalctl --list-boots
+
+# 查看上次開機的日誌（確認是否為 watchdog）
+journalctl -b -1 | grep -E 'watchdog|reboot'
+
+# 查看叢集狀態
+pvecm status
+ha-manager status
+```
+
 ### 健康檢查 (9 項)
 ```bash
 make health-check
